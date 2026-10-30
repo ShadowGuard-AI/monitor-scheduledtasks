@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # monitor-scheduledtasks
 Monitors changes to scheduled tasks, logging task name, trigger time, and associated command. - Focused on System monitoring and alerts
 
