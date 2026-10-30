@@ -9,8 +9,7 @@ Monitors changes to scheduled tasks, logging task name, trigger time, and associ
 
 ## Parameters
 - `-h`: Show help message and exit
-- `-l`: Path to the log file.
-- `-i`: Polling interval in seconds.
+- No other options are implemented: main.py defines no arguments besides `-h`, logs to the console, and polls every 60 seconds.
 
 ## License
 Copyright (c) ShadowStrikeHQ
