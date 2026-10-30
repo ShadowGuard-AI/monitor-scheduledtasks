@@ -1,1 +1,1 @@
-Since `shlex` is part of Python's standard library, it doesn't need to be explicitly installed or have a version specified in a `requirements.txt` file.  Therefore, it should *not* be included.
+# No third-party dependencies: main.py uses only the Python standard library (argparse, logging, subprocess, shlex, time, os, platform), so there is nothing for pip to install.
