@@ -1,118 +1,206 @@
 import argparse
+import glob
+import json
 import logging
-import subprocess
-import shlex
-import time
-import os
 import platform
+import re
+import subprocess
+import sys
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+SHORTHAND_TRIGGERS = {
+    "@reboot", "@yearly", "@annually", "@monthly", "@weekly",
+    "@daily", "@midnight", "@hourly",
+}
+
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=")
+
+WINDOWS_LIST_SCRIPT = (
+    "Get-ScheduledTask | Select-Object TaskName, TaskPath, State, "
+    "@{Name='Actions'; Expression={($_.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments }) -join '; '}}, "
+    "@{Name='TriggerTime'; Expression={($_.Triggers | ForEach-Object { $_.StartBoundary }) -join '; '}} "
+    "| ConvertTo-Json -Depth 4"
+)
+
+WINDOWS_INFO_SCRIPT = (
+    "Get-ScheduledTaskInfo -TaskName $args[0] | "
+    "Select-Object LastRunTime | ConvertTo-Json"
+)
+
 
 def setup_argparse():
     """
     Sets up the argument parser for the script.
     """
     parser = argparse.ArgumentParser(description="Monitors changes to scheduled tasks and logs them.")
-    # No specific CLI arguments are defined in the prompt, so we leave it empty for now.
-    # Consider adding arguments such as log file path, polling interval, etc.
-
-    # Example additions (remove the comment to enable):
-    # parser.add_argument("-l", "--log-file", dest="log_file", help="Path to the log file.", default="scheduled_tasks.log")
-    # parser.add_argument("-i", "--interval", dest="interval", type=int, help="Polling interval in seconds.", default=60)
     return parser.parse_args()
 
-def get_scheduled_tasks():
+
+def _run(argv):
+    """Run a fixed command with an argument list and no shell."""
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout, stderr = process.communicate()
+    return process.returncode, stdout, stderr
+
+
+def _blank_task():
+    return {
+        "task_name": None,
+        "trigger_time": None,
+        "command": None,
+        "last_run_time": None,
+        "task_path": None,
+        "state": None,
+        "actions": None,
+    }
+
+
+def get_windows_tasks():
+    """One structured call: JSON output parsed with json.loads."""
+    returncode, stdout, stderr = _run(
+        ["powershell", "-NoProfile", "-Command", WINDOWS_LIST_SCRIPT]
+    )
+    if returncode != 0:
+        logging.error(f"Error retrieving scheduled tasks: {stderr}")
+        return None
+    try:
+        rows = json.loads(stdout) if stdout.strip() else []
+    except json.JSONDecodeError as e:
+        logging.error(f"Could not parse scheduled task output: {e}")
+        return None
+    if isinstance(rows, dict):
+        rows = [rows]
+    tasks = []
+    for row in rows:
+        task = _blank_task()
+        task["task_name"] = row.get("TaskName")
+        task["task_path"] = row.get("TaskPath")
+        task["state"] = str(row.get("State")) if row.get("State") is not None else None
+        task["actions"] = row.get("Actions")
+        task["command"] = row.get("Actions")
+        task["trigger_time"] = row.get("TriggerTime")
+        # Per task query: the task name travels as one separate argument,
+        # read by the fixed script from $args[0]. No shell is involved.
+        info_rc, info_out, info_err = _run(
+            ["powershell", "-NoProfile", "-Command", WINDOWS_INFO_SCRIPT, task["task_name"]]
+        )
+        if info_rc == 0 and info_out.strip():
+            try:
+                info = json.loads(info_out)
+                if isinstance(info, dict):
+                    task["last_run_time"] = info.get("LastRunTime")
+            except json.JSONDecodeError:
+                logging.error(f"Could not parse task info for {task['task_name']}")
+        elif info_err:
+            logging.error(f"Error retrieving task info for {task['task_name']}: {info_err}")
+        tasks.append(task)
+    return tasks
+
+
+def parse_crontab_text(text, source, has_user=False):
+    """
+    Parse crontab text into task dicts with the same keys used on Windows.
+
+    Handles five field lines, @ shorthand lines such as @daily and
+    @reboot, comment lines, blank lines, and environment assignment
+    lines (which are not tasks).
+    """
+    tasks = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ENV_ASSIGNMENT.match(stripped):
+            continue
+        parts = stripped.split()
+        trigger_time = None
+        rest = None
+        if parts[0] in SHORTHAND_TRIGGERS:
+            trigger_time = parts[0]
+            rest = parts[1:]
+        elif len(parts) > 5:
+            trigger_time = " ".join(parts[:5])
+            rest = parts[5:]
+        else:
+            continue
+        if has_user:
+            if not rest:
+                continue
+            rest = rest[1:]
+        if not rest:
+            continue
+        command = " ".join(rest)
+        task = _blank_task()
+        task["task_name"] = command
+        task["trigger_time"] = trigger_time
+        task["command"] = command
+        task["actions"] = command
+        task["task_path"] = source
+        tasks.append(task)
+    return tasks
+
+
+def get_linux_tasks(system_crontab_path="/etc/crontab", cron_d_dir="/etc/cron.d"):
+    """
+    Read the current user's crontab plus, when present and readable,
+    /etc/crontab and the files in /etc/cron.d. The two path arguments
+    exist so fixture paths can be exercised by a driver.
+    """
+    returncode, stdout, stderr = _run(["crontab", "-l"])
+    tasks = []
+    if returncode != 0:
+        if "no crontab for" in stderr:
+            # The normal empty state: an empty baseline, not an error.
+            logging.info("No crontab for the current user; using an empty baseline for that source.")
+        else:
+            logging.error(f"Error retrieving cron tasks: {stderr}")
+            return None
+    else:
+        tasks.extend(parse_crontab_text(stdout, "crontab (current user)"))
+
+    extra_sources = []
+    if system_crontab_path:
+        extra_sources.append(system_crontab_path)
+    if cron_d_dir:
+        extra_sources.extend(sorted(glob.glob(cron_d_dir + "/*")))
+    for path in extra_sources:
+        try:
+            with open(path, "r") as f:
+                text = f.read()
+        except OSError:
+            continue
+        tasks.extend(parse_crontab_text(text, path, has_user=True))
+    return tasks
+
+
+def get_scheduled_tasks(system_crontab_path="/etc/crontab", cron_d_dir="/etc/cron.d"):
     """
     Retrieves the list of scheduled tasks from the system.
 
     Returns:
-        A list of dictionaries, where each dictionary represents a scheduled task
-        and contains task name, trigger time, and command.
-        Returns None if an error occurs.
+        A list of dictionaries with the same keys on both platforms:
+        task_name, trigger_time, command, last_run_time, task_path,
+        state, and actions. Returns None only on a genuine retrieval
+        error.
     """
     try:
-        # Platform specific command to get scheduled tasks
         if platform.system() == 'Windows':
-            command = "powershell Get-ScheduledTask | Select-Object TaskName, LastRunTime, TaskPath, State, Actions"
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate()
-            if stderr:
-                logging.error(f"Error retrieving scheduled tasks: {stderr}")
-                return None
-
-            tasks = []
-            for line in stdout.splitlines():
-                if line.startswith("TaskName"):
-                    continue # Skip header line
-                if line.strip(): #Handle empty lines
-                    parts = line.split(maxsplit=1)
-                    if len(parts) >= 1:
-                        task_name = parts[0].strip()
-
-                        command_taskpath = "powershell Get-ScheduledTask -TaskName \"{}\" | Select-Object TaskName, LastRunTime, TaskPath, State, Actions".format(task_name)
-                        process_taskpath = subprocess.Popen(command_taskpath, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                        stdout_taskpath, stderr_taskpath = process_taskpath.communicate()
-
-                        if stderr_taskpath:
-                            logging.error(f"Error retrieving task path for {task_name}: {stderr_taskpath}")
-                            continue
-
-                        last_run_time = None
-                        task_path = None
-                        state = None
-                        actions = None
-
-                        for taskline in stdout_taskpath.splitlines():
-                             if "LastRunTime" in taskline:
-                                 last_run_time = taskline.split(":",1)[1].strip()
-                             if "TaskPath" in taskline:
-                                 task_path = taskline.split(":",1)[1].strip()
-                             if "State" in taskline:
-                                  state = taskline.split(":", 1)[1].strip()
-                             if "Actions" in taskline:
-                                  actions = taskline.split(":", 1)[1].strip()
-
-                        tasks.append({
-                            "task_name": task_name,
-                            "last_run_time": last_run_time,
-                            "task_path": task_path,
-                            "state": state,
-                            "actions": actions
-                        })
-            return tasks
-
-        elif platform.system() == 'Linux': # Example for Linux using cron (might need adaptation based on the actual scheduler)
-            command = "crontab -l"
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate()
-            if stderr:
-                logging.error(f"Error retrieving cron tasks: {stderr}")
-                return None
-
-            tasks = []
-            for line in stdout.splitlines():
-                if line.strip() and not line.startswith("#"): # Ignore comments and empty lines
-                    parts = line.split()
-                    if len(parts) > 5:
-                        trigger_time = " ".join(parts[:5])
-                        command = " ".join(parts[5:])
-                        tasks.append({
-                            "task_name": command,  # Using command as task name for simplicity
-                            "trigger_time": trigger_time,
-                            "command": command
-                        })
-            return tasks
+            return get_windows_tasks()
+        elif platform.system() == 'Linux':
+            return get_linux_tasks(system_crontab_path, cron_d_dir)
         else:
             logging.error(f"Unsupported operating system: {platform.system()}")
             return None
-
     except FileNotFoundError:
-        logging.error("crontab command not found. Make sure it is installed and in your PATH.")
+        logging.error("Scheduled task command not found. Make sure it is installed and in your PATH.")
         return None
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         return None
+
 
 def monitor_scheduled_tasks():
     """
@@ -121,11 +209,11 @@ def monitor_scheduled_tasks():
     try:
         previous_tasks = get_scheduled_tasks()
         if previous_tasks is None:
-            logging.error("Failed to retrieve initial scheduled tasks. Exiting.")
-            return
+            logging.error("Failed to retrieve initial scheduled tasks; this run monitors nothing. Exiting.")
+            sys.exit(1)
 
         while True:
-            time.sleep(60)  # Check every 60 seconds (configurable)
+            time.sleep(60)  # Check every 60 seconds
 
             current_tasks = get_scheduled_tasks()
             if current_tasks is None:
@@ -141,7 +229,6 @@ def monitor_scheduled_tasks():
 
             for task_name in added_tasks:
                 task = next(task for task in current_tasks if task['task_name'] == task_name)
-
                 log_message = f"New scheduled task added: Name: {task['task_name']}, Trigger Time: {task.get('trigger_time', 'N/A')}, Command: {task.get('command', 'N/A')}, LastRunTime: {task.get('last_run_time', 'N/A')}, TaskPath: {task.get('task_path', 'N/A')}, State: {task.get('state', 'N/A')}, Actions: {task.get('actions', 'N/A')}"
                 logging.info(log_message)
 
@@ -152,36 +239,33 @@ def monitor_scheduled_tasks():
             for current_task in current_tasks:
                 previous_task = next((task for task in previous_tasks if task['task_name'] == current_task['task_name']), None)
                 if previous_task:
-                  if current_task.get('trigger_time') != previous_task.get('trigger_time') or current_task.get('command') != previous_task.get('command'):
-
-                     log_message = f"Scheduled task updated: Name: {current_task['task_name']}, New Trigger Time: {current_task.get('trigger_time', 'N/A')}, New Command: {current_task.get('command', 'N/A')}, Old Trigger Time: {previous_task.get('trigger_time', 'N/A')}, Old Command: {previous_task.get('command', 'N/A')}, LastRunTime: {current_task.get('last_run_time', 'N/A')}, TaskPath: {current_task.get('task_path', 'N/A')}, State: {current_task.get('state', 'N/A')}, Actions: {current_task.get('actions', 'N/A')}"
-                     logging.info(log_message)
+                    changed = any(
+                        current_task.get(key) != previous_task.get(key)
+                        for key in ('trigger_time', 'command', 'state', 'actions', 'last_run_time')
+                    )
+                    if changed:
+                        log_message = f"Scheduled task updated: Name: {current_task['task_name']}, New Trigger Time: {current_task.get('trigger_time', 'N/A')}, New Command: {current_task.get('command', 'N/A')}, Old Trigger Time: {previous_task.get('trigger_time', 'N/A')}, Old Command: {previous_task.get('command', 'N/A')}, LastRunTime: {current_task.get('last_run_time', 'N/A')}, TaskPath: {current_task.get('task_path', 'N/A')}, State: {current_task.get('state', 'N/A')}, Actions: {current_task.get('actions', 'N/A')}"
+                        logging.info(log_message)
             previous_tasks = current_tasks
 
     except KeyboardInterrupt:
         logging.info("Monitoring stopped by user.")
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+
 
 def main():
     """
     Main function to execute the script.
     """
     args = setup_argparse()
-
-    # Example usage of CLI args: (remove comment to enable)
-    # log_file = args.log_file
-    # interval = args.interval
-    # logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    # logging.info("Scheduled task monitoring started.")
     monitor_scheduled_tasks()
+
 
 if __name__ == "__main__":
     main()
 
-# Usage examples:
-# 1. Run the script with default settings:
+# Usage example:
 #    python main.py
-
-# 2. (If CLI args are added): Run the script with a custom log file and interval:
-#    python main.py -l my_tasks.log -i 120
