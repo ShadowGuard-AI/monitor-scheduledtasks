@@ -84,6 +84,12 @@ def get_windows_tasks():
         task["trigger_time"] = row.get("TriggerTime")
         # Per task query: the task name travels as one separate argument,
         # read by the fixed script from $args[0]. No shell is involved.
+        # Every task costs a separate PowerShell launch on every
+        # cycle, on top of the listing launch. A machine with a few
+        # hundred tasks pays a few hundred process starts a minute
+        # for the last run times, and the query passes the name
+        # without its path, so two tasks sharing a name in different
+        # folders cannot both be answered correctly.
         info_rc, info_out, info_err = _run(
             ["powershell", "-NoProfile", "-Command", WINDOWS_INFO_SCRIPT, task["task_name"]]
         )
@@ -172,6 +178,11 @@ def get_linux_tasks(system_crontab_path="/etc/crontab", cron_d_dir="/etc/cron.d"
                 text = f.read()
         except OSError:
             continue
+        # Every file the glob finds in cron.d is parsed as a crontab,
+        # including editor backups and placeholder files a package
+        # left behind, and every one of them is read as carrying a
+        # user column. A stray file with five leading fields becomes
+        # a task I then watch as though the system had scheduled it.
         tasks.extend(parse_crontab_text(text, path, has_user=True))
     return tasks
 
@@ -221,6 +232,13 @@ def monitor_scheduled_tasks():
                 continue
 
             # Compare tasks
+            # Identity here is the name alone, and on the cron side the
+            # name is the command string itself. Two entries running the
+            # same command on different schedules collapse into one set
+            # member and one first match in the lookups below: editing
+            # the second entry's schedule changes nothing I can see,
+            # because the first entry with that name is the one always
+            # compared.
             previous_task_names = {task['task_name'] for task in previous_tasks}
             current_task_names = {task['task_name'] for task in current_tasks}
 
@@ -239,6 +257,12 @@ def monitor_scheduled_tasks():
             for current_task in current_tasks:
                 previous_task = next((task for task in previous_tasks if task['task_name'] == current_task['task_name']), None)
                 if previous_task:
+                    # last_run_time is one of the compared fields, so on Windows
+                    # a task simply running is reported as a scheduled task
+                    # updated, with new and old trigger and command printed as
+                    # though someone edited it. On a busy machine the update
+                    # entries are mostly executions, and a real edit hides among
+                    # them wearing the same wording.
                     changed = any(
                         current_task.get(key) != previous_task.get(key)
                         for key in ('trigger_time', 'command', 'state', 'actions', 'last_run_time')
